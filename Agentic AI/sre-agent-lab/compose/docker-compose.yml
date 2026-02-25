@@ -1,0 +1,368 @@
+version: "3.9"
+
+networks:
+  sre-lab:
+    driver: bridge
+
+services:
+
+  # ─────────────────────────────────────────
+  # Prometheus
+  # ─────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.2
+    container_name: prometheus
+    restart: unless-stopped
+    networks:
+      - sre-lab
+    ports:
+      - "9090:9090"
+    volumes:
+      - ../prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+      - "--web.enable-lifecycle"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+
+  # ─────────────────────────────────────────
+  # Alertmanager
+  # ─────────────────────────────────────────
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: alertmanager
+    restart: unless-stopped
+    networks:
+      - sre-lab
+    ports:
+      - "9093:9093"
+    volumes:
+      - ../prometheus/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+      - "--web.external-url=http://localhost:9093"
+    depends_on:
+      - smtp4dev
+
+  # ─────────────────────────────────────────
+  # Grafana
+  # ─────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: grafana
+    restart: unless-stopped
+    networks:
+      - sre-lab
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ALERTING_ENABLED: "false"
+      GF_UNIFIED_ALERTING_ENABLED: "false"
+    volumes:
+      - ../grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ../grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+  # ─────────────────────────────────────────
+  # cAdvisor  (optional — comment out if not needed)
+  # ─────────────────────────────────────────
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: cadvisor
+    restart: unless-stopped
+    networks:
+      - sre-lab
+    ports:
+      - "8080:8080"
+    privileged: true
+    devices:
+      - /dev/kmsg:/dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /sys/fs/cgroup:/sys/fs/cgroup:ro
+    command:
+      - "--housekeeping_interval=10s"
+      - "--max_housekeeping_interval=15s"
+      - "--allow_dynamic_housekeeping=true"
+
+  # ─────────────────────────────────────────
+  # smtp4dev  (local catch-all SMTP + web UI)
+  # ─────────────────────────────────────────
+  smtp4dev:
+    image: rnwood/smtp4dev:v3
+    container_name: smtp4dev
+    restart: unless-stopped
+    networks:
+      - sre-lab
+    ports:
+      - "5000:80"
+      - "25:25"
+    environment:
+      ServerOptions__HostName: smtp4dev
+      ServerOptions__SmtpPort: 25
+      ServerOptions__ImapPort: 143
+
+  # ─────────────────────────────────────────
+  # sre-agent
+  # Alertmanager webhook receiver + incident store.
+  #
+  # Build:   docker compose build sre-agent
+  # Rebuild: docker compose build --no-cache sre-agent
+  # Logs:    docker compose logs -f sre-agent
+  #
+  # Swagger UI:  http://localhost:8081/docs
+  # Incidents:   http://localhost:8081/incidents
+  # Metrics:     http://localhost:8081/metrics
+  #
+  # SQLite DB bind-mounted to ./data/sre_agent.db — inspect with:
+  #   sqlite3 ./data/sre_agent.db "SELECT * FROM incidents;"
+  # ─────────────────────────────────────────
+  sre-agent:
+    build:
+      context: ../sre-agent
+      dockerfile: Dockerfile
+    image: sre-agent:latest
+    container_name: sre-agent
+    restart: unless-stopped
+    networks:
+      - sre-lab
+    ports:
+      - "8081:8080"               # host 8081 → container 8080 (avoids clash with cAdvisor)
+    environment:
+      PORT: "8080"
+      DB_PATH: "/data/sre_agent.db"
+      PROMETHEUS_URL: "http://prometheus:9090"
+      EVIDENCE_DIR: "/data/evidence"
+      COLLECT_TIMEOUT: "30"
+      GRAFANA_URL: "http://localhost:3001"
+      GRAFANA_DATASOURCE: "prometheus"
+      SMTP_HOST: "smtp4dev"
+      SMTP_PORT: "25"
+      EMAIL_FROM: "sre-agent@lab.local"
+      EMAIL_TO: "oncall@lab.local"
+      EMAIL_ENABLED: "true"
+      SLACK_WEBHOOK_URL: ""
+      TELEGRAM_BOT_TOKEN: ""
+      TELEGRAM_CHAT_ID: ""
+      GITHUB_TOKEN: ""
+      GITHUB_REPO: ""                  # owner/repo
+      LLM_PROVIDER: "none"                # openai | claude | none
+      OPENAI_API_KEY: ""
+      OPENAI_MODEL: "gpt-4o-mini"
+      ANTHROPIC_API_KEY: ""
+      ANTHROPIC_MODEL: "claude-3-5-sonnet-latest"
+      SCAN_INTERVAL_MIN: "5"
+      FLAKY_ERROR_RATE_THRESHOLD: "0.05"
+      RESTARTS_5M_THRESHOLD: "1.0"
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ../data:/data              # bind-mount: SQLite + evidence JSON at ../data/ on host
+    depends_on:
+      - prometheus
+      - alertmanager
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # CHAOS SERVICES
+  #
+  # cpu-hog, mem-leak, and disk-filler use Docker Compose profiles so they
+  # are NOT started by a plain `docker compose up -d`.
+  #
+  # Start a chaos service:   docker compose --profile chaos up -d cpu-hog
+  # Stop a chaos service:    docker compose stop cpu-hog
+  # Start all chaos at once: docker compose --profile chaos up -d
+  #
+  # flaky-api runs always (no profile) so Prometheus can scrape /metrics.
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  # ─────────────────────────────────────────
+  # cpu-hog
+  # Burns CPU using stress-ng.
+  #
+  # Tune with environment variables (override at runtime with -e):
+  #   CPU_WORKERS  — stressor worker threads      (default: 2)
+  #   CPU_LOAD     — target % load per worker     (default: 80)
+  #   DURATION     — run time in seconds, 0=∞     (default: 0)
+  #
+  # Example — run at 95% for 2 minutes then exit:
+  #   docker compose --profile chaos run --rm -e CPU_LOAD=95 -e DURATION=120 cpu-hog
+  # ─────────────────────────────────────────
+  cpu-hog:
+    image: alexeiled/stress-ng:latest
+    container_name: cpu-hog
+    restart: "no"
+    profiles:
+      - chaos
+    networks:
+      - sre-lab
+    environment:
+      CPU_WORKERS: "2"
+      CPU_LOAD: "80"
+      DURATION: "0"
+    command: >
+      sh -c 'stress-ng
+        --cpu        $${CPU_WORKERS}
+        --cpu-load   $${CPU_LOAD}
+        --timeout    $${DURATION}
+        --metrics-brief'
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"             # cap so it cannot starve the whole WSL2 VM
+
+  # ─────────────────────────────────────────
+  # mem-leak
+  # Allocates CHUNK_MB of memory every INTERVAL_SEC seconds up to CEILING_MB,
+  # then holds. The 512 MB hard limit means Docker will OOM-kill it naturally.
+  #
+  # Tune with environment variables:
+  #   CHUNK_MB      — MB allocated per step        (default: 10)
+  #   INTERVAL_SEC  — seconds between allocations  (default: 5)
+  #   CEILING_MB    — soft stop before OOM         (default: 450)
+  #
+  # Watch live:  docker stats mem-leak
+  # ─────────────────────────────────────────
+  mem-leak:
+    image: python:3.12-slim
+    container_name: mem-leak
+    restart: "no"
+    profiles:
+      - chaos
+    networks:
+      - sre-lab
+    environment:
+      CHUNK_MB: "10"
+      INTERVAL_SEC: "5"
+      CEILING_MB: "450"
+    command: >
+      python3 -c "
+      import os, time
+      chunk   = int(os.environ.get('CHUNK_MB',     10))  * 1024 * 1024
+      delay   = int(os.environ.get('INTERVAL_SEC',  5))
+      ceiling = int(os.environ.get('CEILING_MB',  450))  * 1024 * 1024
+      pool, total = [], 0
+      print('mem-leak: allocating {}MB every {}s (ceiling {}MB)'.format(
+            chunk//1024//1024, delay, ceiling//1024//1024), flush=True)
+      while True:
+          if total < ceiling:
+              pool.append(bytearray(chunk))
+              total += chunk
+              print('Allocated: {:.0f} MB total'.format(total/1024/1024), flush=True)
+          else:
+              print('Ceiling reached — holding', flush=True)
+          time.sleep(delay)
+      "
+    deploy:
+      resources:
+        limits:
+          memory: 512m            # OOM kill is intentional chaos behaviour
+
+  # ─────────────────────────────────────────
+  # disk-filler
+  # Writes CHUNK_MB random-data files into /data every INTERVAL_SEC seconds
+  # until FILL_LIMIT_MB is reached, then holds.
+  #
+  # Tune with environment variables:
+  #   CHUNK_MB      — size of each file in MB     (default: 100)
+  #   INTERVAL_SEC  — seconds between writes      (default: 10)
+  #   FILL_LIMIT_MB — total MB cap                (default: 2048)
+  #
+  # Inspect usage:  docker exec disk-filler du -sh /data
+  # Wipe the data:  docker compose down -v  (removes the named volume)
+  # ─────────────────────────────────────────
+  disk-filler:
+    image: python:3.12-slim
+    container_name: disk-filler
+    restart: "no"
+    profiles:
+      - chaos
+    networks:
+      - sre-lab
+    volumes:
+      - disk_filler_data:/data    # isolated named volume — safe to destroy
+    environment:
+      CHUNK_MB: "100"
+      INTERVAL_SEC: "10"
+      FILL_LIMIT_MB: "2048"
+    command: >
+      python3 -c "
+      import os, time, glob
+      chunk   = int(os.environ.get('CHUNK_MB',     100))  * 1024 * 1024
+      delay   = int(os.environ.get('INTERVAL_SEC',  10))
+      limit   = int(os.environ.get('FILL_LIMIT_MB', 2048)) * 1024 * 1024
+      datadir = '/data'
+      count   = len(glob.glob(datadir + '/fill_*.bin'))
+      written = count * chunk
+      print('disk-filler: {}MB chunks every {}s (limit {}MB)'.format(
+            chunk//1024//1024, delay, limit//1024//1024), flush=True)
+      while True:
+          if written < limit:
+              path = os.path.join(datadir, 'fill_{:06d}.bin'.format(count))
+              with open(path, 'wb') as f:
+                  f.write(os.urandom(chunk))
+              count   += 1
+              written += chunk
+              print('Written: {:.0f} MB total'.format(written/1024/1024), flush=True)
+          else:
+              print('Limit reached — holding', flush=True)
+          time.sleep(delay)
+      "
+
+  # ─────────────────────────────────────────
+  # flaky-api
+  # Always-running Flask API used as a scrape target and chaos experiment subject.
+  #
+  # Endpoints:
+  #   GET  /                            health check (affected by injected chaos)
+  #   GET  /metrics                     Prometheus metrics
+  #   POST /chaos/latency?ms=<n>        inject n ms latency  (0 = disable)
+  #   POST /chaos/errors?rate=<r>       inject error rate 0.0–1.0 (0 = disable)
+  #   POST /chaos/reset                 clear all injected faults
+  #
+  # Example — inject 500 ms latency:
+  #   curl -X POST "http://localhost:8000/chaos/latency?ms=500"
+  # Example — make 40% of requests fail:
+  #   curl -X POST "http://localhost:8000/chaos/errors?rate=0.4"
+  # ─────────────────────────────────────────
+  flaky-api:
+    build:
+      context: ../chaos/flasky_API
+      dockerfile: Dockerfile
+    image: flaky-api:latest
+    container_name: flaky-api
+    restart: unless-stopped
+    networks:
+      - sre-lab
+    ports:
+      - "8000:8000"               # optional host port — remove if not needed
+    environment:
+      PORT: "8000"
+
+# ─────────────────────────────────────────
+# Named volumes
+# ─────────────────────────────────────────
+volumes:
+  prometheus_data:
+  alertmanager_data:
+  grafana_data:
+  disk_filler_data:               # isolated — destroy safely with: docker compose down -v

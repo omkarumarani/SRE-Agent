@@ -1,0 +1,90 @@
+global:
+  # smtp4dev — used for fallback email receiver (see receivers below).
+  smtp_smarthost: "smtp4dev:25"
+  smtp_from: "alertmanager@lab.local"
+  smtp_require_tls: false
+
+# ── Routing tree ──────────────────────────────────────────────────────────────
+#
+# All alerts fall through to the default "sre-agent" webhook receiver.
+# Add child routes here to fork specific alerts to email/Slack/etc., e.g.:
+#
+#   routes:
+#     - match:
+#         severity: critical
+#       receiver: email-fallback
+#       continue: true   # still also send to sre-agent
+#
+# group_by:     collect alerts with the same labels into a single notification.
+# group_wait:   wait this long for more alerts before sending the first batch.
+# group_interval: how long to wait before sending new alerts added to an existing group.
+# repeat_interval: how long to wait before re-notifying a still-firing alert.
+# ──────────────────────────────────────────────────────────────────────────────
+route:
+  receiver: sre-agent
+  group_by:
+    - alertname
+    - container_name
+    - severity
+  group_wait: 10s
+  group_interval: 30s
+  repeat_interval: 1h
+
+  routes:
+    # Critical alerts get a shorter repeat so the agent retries remediation sooner.
+    - matchers:
+        - severity = critical
+      receiver: sre-agent
+      group_wait: 5s
+      repeat_interval: 15m
+      continue: false
+
+    # Warning alerts are batched more aggressively to reduce noise.
+    - matchers:
+        - severity = warning
+      receiver: sre-agent
+      group_wait: 30s
+      repeat_interval: 1h
+      continue: false
+
+# ── Inhibition rules ──────────────────────────────────────────────────────────
+# Suppress warning-level alerts for a container when a critical alert is
+# already firing for that same container — avoids double-paging the agent.
+inhibit_rules:
+  - source_matchers:
+      - severity = critical
+    target_matchers:
+      - severity = warning
+    equal:
+      - container_name
+
+# ── Receivers ─────────────────────────────────────────────────────────────────
+receivers:
+
+  # Primary: sre-agent webhook
+  # The agent is not required to be running — Alertmanager will retry delivery
+  # and log failures gracefully. Start the agent when ready and alerts will flow.
+  - name: sre-agent
+    webhook_configs:
+      - url: "http://sre-agent:8080/alert"
+        send_resolved: true       # notify agent when an alert clears
+        http_config:
+          follow_redirects: true
+        max_alerts: 20            # cap batch size so agent prompts stay manageable
+
+  # Fallback: email via smtp4dev (uncomment a route above to use this)
+  - name: email-fallback
+    email_configs:
+      - to: "oncall@lab.local"
+        headers:
+          Subject: "[{{ .Status | toUpper }}] {{ .GroupLabels.alertname }} — {{ .GroupLabels.container_name }}"
+        html: |
+          {{ range .Alerts }}
+          <b>Alert:</b> {{ .Labels.alertname }}<br/>
+          <b>Container:</b> {{ .Labels.container_name }}<br/>
+          <b>Severity:</b> {{ .Labels.severity }}<br/>
+          <b>Summary:</b> {{ .Annotations.summary }}<br/>
+          <b>Description:</b> {{ .Annotations.description }}<br/>
+          <hr/>
+          {{ end }}
+        send_resolved: true

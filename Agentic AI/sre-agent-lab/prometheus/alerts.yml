@@ -1,0 +1,181 @@
+# alerts.yml — cAdvisor-based alert rules for sre-agent-lab
+#
+# TUNING GUIDE
+# ────────────────────────────────────────────────────────────────────────────
+# CPU threshold (HighContainerCPU)
+#   - Expressed as a ratio: 0.80 = 80% of one CPU core.
+#   - cAdvisor reports cumulative CPU seconds; the rate() gives cores-in-use.
+#   - For multi-core containers raise to e.g. 1.6 (80% of 2 cores).
+#   - Lab default: 0.80 (intentionally low to make chaos easy to trigger).
+#
+# Memory threshold (HighContainerMemory)
+#   - Expressed in bytes: 500Mi = 524288000.
+#   - Tune per-container by checking `docker stats` baseline usage.
+#   - Lab default: 500Mi — enough headroom for Prometheus/Grafana, tight for app containers.
+#   - Alternatively switch to a % of limit:
+#       expr: container_memory_usage_bytes / container_spec_memory_limit_bytes > 0.85
+#     (only works if the container has a memory limit set in compose).
+#
+# Restart threshold (ContainerRestarts)
+#   - increase() counts new restarts in the look-back window.
+#   - Lab default: > 2 restarts in 5 min — one-off blips are ignored, crash loops fire.
+#   - Set to > 0 to alert on any restart at all.
+#
+# For in and out effect label filtering, add a `container` label matcher, e.g.:
+#   expr: ... and on(name) container_last_seen{name="flaky-api"}
+# ────────────────────────────────────────────────────────────────────────────
+
+groups:
+  - name: container_health
+    interval: 30s   # evaluate this group every 30 s (overrides global 15 s for these noisy metrics)
+
+    rules:
+
+      # ── 1. High Container CPU ─────────────────────────────────────────────
+      # rate() over 2 min smooths short bursts; raise [2m] to [5m] for less sensitivity.
+      # Threshold: 0.80 cores. Raise to 1.5+ for CPU-heavy workloads.
+      - alert: HighContainerCPU
+        expr: |
+          rate(container_cpu_usage_seconds_total{
+            image!="",
+            name!=""
+          }[2m]) > 0.80
+        for: 2m
+        labels:
+          severity: warning
+          service: "{{ $labels.name }}"
+          container_name: "{{ $labels.name }}"
+        annotations:
+          summary: "High CPU on container {{ $labels.name }}"
+          description: >
+            Container {{ $labels.name }} has been using
+            {{ printf "%.2f" $value }} CPU cores (> 80%) for more than 2 minutes.
+            Node: {{ $labels.instance }}.
+          runbook: "docs/runbooks/high-cpu.md"
+
+      # ── 2. High Container Memory ──────────────────────────────────────────
+      # container_memory_usage_bytes includes cache; use container_memory_working_set_bytes
+      # for a tighter "real" RSS measure (excludes reclaimable page cache).
+      # Threshold: 500 MiB = 524288000 bytes. Tune per workload (see header).
+      - alert: HighContainerMemory
+        expr: |
+          container_memory_working_set_bytes{
+            image!="",
+            name!=""
+          } > 524288000
+        for: 2m
+        labels:
+          severity: warning
+          service: "{{ $labels.name }}"
+          container_name: "{{ $labels.name }}"
+        annotations:
+          summary: "High memory on container {{ $labels.name }}"
+          description: >
+            Container {{ $labels.name }} working-set memory is
+            {{ printf "%.0f" $value | humanize }}B (> 500 MiB) for more than 2 minutes.
+            Node: {{ $labels.instance }}.
+          runbook: "docs/runbooks/high-memory.md"
+
+      # ── 3. Container Restarts ─────────────────────────────────────────────
+      # increase() counts restarts in the look-back window.
+      # Threshold: > 2 restarts in 5 min catches crash loops, ignores one-off restarts.
+      # Lower to > 0 to alert on any restart.
+      - alert: ContainerRestarts
+        expr: |
+          increase(container_restart_count{
+            image!="",
+            name!=""
+          }[5m]) > 2
+        for: 0m   # fire immediately — restarts are already a trailing indicator
+        labels:
+          severity: critical
+          service: "{{ $labels.name }}"
+          container_name: "{{ $labels.name }}"
+        annotations:
+          summary: "Container {{ $labels.name }} is crash-looping"
+          description: >
+            Container {{ $labels.name }} has restarted
+            {{ printf "%.0f" $value }} times in the last 5 minutes.
+            Node: {{ $labels.instance }}.
+          runbook: "docs/runbooks/container-restarts.md"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  - name: flaky_api
+    # Evaluated every 15 s (inherits global) — flaky-api metrics are fine-grained
+    # enough that the default interval is appropriate.
+    #
+    # TUNING GUIDE
+    # ──────────────────────────────────────────────────────────────────────────
+    # HighErrorRateFlakyAPI
+    #   - Uses a 2-minute rate window to smooth single-request blips.
+    #   - Threshold: 10% errors (0.10). Lower to 0.05 for stricter SLOs,
+    #     raise to 0.25 if you want alerts only during heavy chaos runs.
+    #   - `for: 1m` means the rate must stay above threshold for a full minute
+    #     before firing — avoids noisy one-off spikes.
+    #   - The `job="flaky-api"` matcher scopes the alert to this service only
+    #     so it won't fire if you add other jobs with similar metric names.
+    #
+    # HighLatencyP95FlakyAPI
+    #   - histogram_quantile() reconstructs the p95 from the histogram buckets.
+    #   - Threshold: 0.5 s (500 ms). Raise to 1.0 or 2.0 for deliberately slow
+    #     workloads, lower to 0.1 for latency-sensitive demos.
+    #   - Uses a 5-minute rate window: shorter windows make p95 estimates noisy;
+    #     longer windows make the alert slow to clear after /reset. 5 m is a
+    #     reasonable middle ground for a lab.
+    #   - `for: 2m` gives injected latency time to stabilise before firing.
+    # ──────────────────────────────────────────────────────────────────────────
+
+    rules:
+
+      # ── 1. High Error Rate — flaky-api ───────────────────────────────────
+      # Fires when >10% of /work requests return 5xx over a 2-minute window.
+      # Trigger:  curl -X POST "http://localhost:8000/toggle_error_rate?rate=0.3"
+      # Resolve:  curl -X POST "http://localhost:8000/reset"
+      - alert: HighErrorRateFlakyAPI
+        expr: |
+          (
+            rate(flaky_api_requests_total{job="flaky-api", status_code=~"5.."}[2m])
+            /
+            rate(flaky_api_requests_total{job="flaky-api"}[2m])
+          ) > 0.10
+        for: 1m
+        labels:
+          severity: critical
+          service: flaky-api
+          container_name: flaky-api
+        annotations:
+          summary: "flaky-api error rate above 10%"
+          description: >
+            flaky-api is returning HTTP 5xx on {{ humanizePercentage $value }}
+            of requests (threshold 10%) — sustained for more than 1 minute.
+            Current injected error rate gauge: {{ $labels.instance }}.
+            To inspect: curl http://localhost:8000/work
+            To reset:   curl -X POST http://localhost:8000/reset
+          runbook: "docs/runbooks/flaky-api-errors.md"
+
+      # ── 2. High p95 Latency — flaky-api ──────────────────────────────────
+      # Fires when the 95th-percentile response time exceeds 500 ms over 5 minutes.
+      # Trigger:  curl -X POST "http://localhost:8000/toggle_latency?ms=600"
+      # Resolve:  curl -X POST "http://localhost:8000/reset"
+      - alert: HighLatencyP95FlakyAPI
+        expr: |
+          histogram_quantile(
+            0.95,
+            rate(flaky_api_request_duration_seconds_bucket{
+              job="flaky-api",
+              endpoint="/work"
+            }[5m])
+          ) > 0.5
+        for: 2m
+        labels:
+          severity: warning
+          service: flaky-api
+          container_name: flaky-api
+        annotations:
+          summary: "flaky-api p95 latency above 500 ms"
+          description: >
+            flaky-api p95 response time on /work is
+            {{ printf "%.3f" $value }}s (threshold 0.5s) — sustained for more than 2 minutes.
+            To inspect injected latency: curl http://localhost:8000/health
+            To reset:                    curl -X POST http://localhost:8000/reset
+          runbook: "docs/runbooks/flaky-api-latency.md"

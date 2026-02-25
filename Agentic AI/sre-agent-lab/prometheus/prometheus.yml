@@ -1,0 +1,49 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  scrape_timeout: 10s
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+
+  # Prometheus self-scrape
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - prometheus:9090
+
+  # Alertmanager
+  - job_name: alertmanager
+    static_configs:
+      - targets:
+          - alertmanager:9093
+
+  # cAdvisor — container resource metrics
+  - job_name: cadvisor
+    static_configs:
+      - targets:
+          - cadvisor:8080
+
+  # ── Placeholders (uncomment when services are running) ──────────────────────
+
+  # SRE Agent
+  # - job_name: sre-agent
+  #   static_configs:
+  #     - targets:
+  #         - sre-agent:8080
+  #   metrics_path: /metrics
+
+  # Flaky API — chaos experiment target
+  - job_name: flaky-api
+    static_configs:
+      - targets:
+          - flaky-api:8000
+    metrics_path: /metrics

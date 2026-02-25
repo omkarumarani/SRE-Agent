@@ -1,0 +1,12 @@
+apiVersion: 1
+
+providers:
+  - name: sre-lab-dashboards
+    orgId: 1
+    folder: SRE Lab
+    type: file
+    disableDeletion: false
+    editable: true
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/provisioning/dashboards
